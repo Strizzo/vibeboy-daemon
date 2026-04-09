@@ -75,10 +75,10 @@ def list_sessions() -> dict:
     return sessions
 
 
-def capture_pane(session_name: str, lines: int = 50) -> str:
+def capture_pane(session_name: str) -> str:
     """Capture visible terminal output from a session's active pane."""
     try:
-        return tmux("capture-pane", "-t", session_name, "-p", "-l", str(lines))
+        return tmux("capture-pane", "-t", session_name, "-p")
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ""
 
