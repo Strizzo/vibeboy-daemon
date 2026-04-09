@@ -2,11 +2,23 @@
 """VibeBoy Daemon - HTTP API for managing tmux sessions and Claude Code."""
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from flask import Flask, jsonify, request
+
+# Strip ANSI escape sequences from terminal output
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b\[[\?]?[0-9;]*[hlm]')
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes and non-printable characters."""
+    text = _ANSI_RE.sub('', text)
+    # Remove any remaining non-printable chars except newline/tab
+    text = ''.join(c for c in text if c == '\n' or c == '\t' or (ord(c) >= 32 and ord(c) < 127) or ord(c) >= 160)
+    return text
 
 app = Flask(__name__)
 
@@ -78,7 +90,8 @@ def list_sessions() -> dict:
 def capture_pane(session_name: str) -> str:
     """Capture visible terminal output from a session's active pane."""
     try:
-        return tmux("capture-pane", "-t", session_name, "-p")
+        raw = tmux("capture-pane", "-t", session_name, "-p")
+        return strip_ansi(raw)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ""
 
