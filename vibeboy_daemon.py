@@ -85,12 +85,26 @@ def analyze_session(terminal: str, name: str) -> dict:
     status = "idle"
     options = []
 
-    # Detect Claude Code
+    # Detect Claude Code permission prompt / waiting state
+    cc_permission = any(x in last_text for x in (
+        'bypass permissions', 'shift+tab to cycle', 'allow once',
+        'allow always', 'deny', 'approve for this session',
+    ))
+    cc_question = any(x in last_text for x in (
+        'do you want', 'would you like', 'shall i', 'should i',
+        'proceed?', 'continue?', 'confirm?',
+    ))
+    cc_thinking = any(x in last_text for x in (
+        'thinking', 'generating', 'processing', 'searching',
+        'reading', 'writing', 'editing',
+    ))
+
+    # Detect Claude Code by session name or terminal content
     is_claude = any(
-        x in last_text for x in ('claude', 'anthropic', 'thinking', 'tool_use')
+        x in last_text for x in ('claude', 'anthropic', 'tool_use', 'claude-code')
     ) or any(
         x in name.lower() for x in ('claude', 'cc-', 'cc_')
-    )
+    ) or cc_permission
 
     # Detect Y/N or yes/no prompts
     yn_match = re.search(r'\[([yY]/[nN]|[nN]/[yY])\]', last_line) or \
@@ -98,24 +112,30 @@ def analyze_session(terminal: str, name: str) -> dict:
                re.search(r'\(y/n\)', last_line, re.IGNORECASE)
 
     # Detect generic question (ends with ?)
-    is_question = last_line.endswith('?')
+    is_question = last_line.rstrip().endswith('?')
 
     # Detect shell prompt ($ or # at end, possibly with path)
     is_shell = bool(re.search(r'[$#]\s*$', last_line))
 
     # Detect running process (no prompt visible)
-    has_activity = len(last_line) > 0 and not is_shell
+    has_activity = len(last_line.strip()) > 0 and not is_shell
 
     if is_claude:
         session_type = "claude_code"
-        if yn_match or is_question:
+        if cc_permission:
+            status = "waiting"
+            options.append({"text": "Allow once", "category": "approve", "keys": "Enter"})
+            options.append({"text": "Allow always", "category": "approve"})
+            options.append({"text": "Deny", "category": "deny"})
+        elif cc_question or yn_match or is_question:
             status = "waiting"
             options.append({"text": "Yes", "category": "approve"})
             options.append({"text": "No", "category": "deny"})
-        elif 'thinking' in last_text or 'running' in last_text:
+        elif cc_thinking:
             status = "thinking"
         elif is_shell:
             status = "idle"
+            options.append({"text": "claude", "category": "custom", "keys": "claude"})
         else:
             status = "running"
     elif yn_match:
@@ -135,13 +155,17 @@ def analyze_session(terminal: str, name: str) -> dict:
         session_type = "running_process"
         status = "running"
 
-    # Always add common actions
-    options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
-
-    if session_type == "idle_shell":
-        options.insert(0, {"text": "Run: ls -la", "category": "custom", "keys": "ls -la"})
-        options.insert(0, {"text": "Run: git status", "category": "custom", "keys": "git status"})
-        options.insert(0, {"text": "Run: htop", "category": "custom", "keys": "htop"})
+    # Common actions based on type
+    if session_type == "running_process":
+        options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
+        options.append({"text": "Suspend (Ctrl+Z)", "category": "custom", "keys": "C-z"})
+    elif session_type == "idle_shell":
+        options.insert(0, {"text": "git status", "category": "custom", "keys": "git status"})
+        options.insert(0, {"text": "git log --oneline -10", "category": "custom", "keys": "git log --oneline -10"})
+        options.insert(0, {"text": "ls -la", "category": "custom", "keys": "ls -la"})
+        options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
+    else:
+        options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
 
     return {
         "session_type": session_type,
