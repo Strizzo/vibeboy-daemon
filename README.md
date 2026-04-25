@@ -31,8 +31,8 @@ WorkingDirectory=%h/vibeboy-daemon
 ExecStart=/usr/bin/python3 vibeboy_daemon.py
 Restart=always
 RestartSec=3
-# Optional: enable LLM-powered prompt suggestions for Claude Code sessions
-# Environment=ANTHROPIC_API_KEY=sk-ant-...
+# Make sure claude CLI is on PATH
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -63,16 +63,19 @@ See the [VibeBoy cartridge README](https://github.com/Strizzo/vibeboy-cartridge)
 
 ## LLM-Powered Suggestions
 
-When Claude Code is waiting for your next prompt, the daemon can suggest contextual prompts based on the conversation. Set `ANTHROPIC_API_KEY` to enable:
+When Claude Code is waiting for your next prompt, the daemon uses your existing `claude` CLI to suggest contextual prompts based on the conversation. No separate API key needed — it uses your Claude Code Pro authentication.
 
-```bash
-# In your shell or in the systemd service
-export ANTHROPIC_API_KEY=sk-ant-...
+The daemon auto-discovers the `claude` binary in standard locations (`~/.local/bin/claude`, `~/.npm-global/bin/claude`, etc.). Override with the `VIBEBOY_CLAUDE_CLI` env var if needed:
+
+```ini
+# In ~/.config/systemd/user/vibeboy.service
+Environment=VIBEBOY_CLAUDE_CLI=/path/to/claude
+Environment=VIBEBOY_LLM_TIMEOUT=20
 ```
 
-Without an API key, the daemon falls back to generic prompts ("continue", "explain", etc.).
+If `claude` isn't found, the daemon falls back to generic prompts ("continue", "explain", etc.).
 
-The daemon uses Claude Haiku for cheap, fast suggestions. Each Claude Code session triggers ~1 API call per minute when actively used.
+Suggestions are cached per session for 60 seconds and refreshed asynchronously, so the API stays responsive.
 
 ## Actions
 

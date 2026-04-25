@@ -64,22 +64,40 @@ def clean_terminal(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM-based prompt suggestions
+# LLM-based prompt suggestions (via claude CLI)
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
-_anthropic_client = None
-if ANTHROPIC_API_KEY:
+# Find claude CLI in common locations
+def _find_claude_cli():
+    candidates = [
+        os.path.expanduser("~/.local/bin/claude"),
+        os.path.expanduser("~/.npm-global/bin/claude"),
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    # Fallback: check PATH
     try:
-        from anthropic import Anthropic
-        _anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    except ImportError:
-        print("anthropic package not installed; LLM suggestions disabled")
+        result = subprocess.run(
+            ["bash", "-lc", "command -v claude"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+CLAUDE_CLI = os.environ.get('VIBEBOY_CLAUDE_CLI') or _find_claude_cli()
+LLM_TIMEOUT = int(os.environ.get('VIBEBOY_LLM_TIMEOUT', '20'))
 
 # Cache: session_name -> (terminal_hash, suggestions, timestamp)
 _suggestion_cache = {}
 _suggestion_lock = threading.Lock()
-_inflight = set()  # session names currently being processed
+_inflight = set()
 _inflight_lock = threading.Lock()
 
 CACHE_TTL_SECONDS = 60
@@ -91,45 +109,55 @@ def _terminal_hash(terminal: str) -> str:
 
 
 def _fetch_llm_suggestions(session_name: str, terminal: str):
-    """Call Anthropic API to generate contextual prompt suggestions."""
-    if not _anthropic_client:
+    """Run `claude -p` to generate contextual prompt suggestions."""
+    if not CLAUDE_CLI:
         return None
+
+    # Use the last ~2KB of terminal content as context
+    context = terminal[-2000:]
+    prompt = (
+        "I'm using Claude Code on a tiny handheld device with a tiny screen. "
+        "Looking at the recent Claude Code session output below, suggest 5 SHORT "
+        "next-message prompts I could send to Claude. Each prompt MUST be under "
+        "30 characters. Make them contextually useful based on what's happening "
+        "in the conversation. Output ONLY a JSON array of strings, nothing else "
+        "before or after.\n\n"
+        f"Session output:\n```\n{context}\n```\n\nJSON array:"
+    )
+
     try:
-        # Use the last ~2KB of terminal content as context
-        context = terminal[-2000:]
-        msg = _anthropic_client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=400,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "I'm using Claude Code on a tiny handheld device with a tiny screen. "
-                    "Looking at the recent Claude Code session below, suggest 5 SHORT next-message "
-                    "prompts I could send to Claude. Each prompt MUST be under 30 characters. "
-                    "Make them contextually useful based on what's happening. "
-                    "Output ONLY a JSON array of strings, nothing else.\n\n"
-                    f"Session output:\n```\n{context}\n```\n\nJSON array:"
-                )
-            }]
+        result = subprocess.run(
+            [CLAUDE_CLI, "-p", prompt],
+            capture_output=True, text=True, timeout=LLM_TIMEOUT,
         )
-        text = msg.content[0].text.strip()
+        if result.returncode != 0:
+            print(f"claude CLI failed ({result.returncode}): {result.stderr[:200]}",
+                  file=sys.stderr)
+            return None
+
+        text = result.stdout.strip()
         # Extract JSON array
-        m = re.search(r'\[[^\[]*\]', text, re.DOTALL)
-        if m:
-            suggestions = json.loads(m.group())
-            if isinstance(suggestions, list):
-                # Convert to option format
-                opts = []
-                for s in suggestions[:5]:
-                    if isinstance(s, str) and s:
-                        opts.append({
-                            "text": s[:30],
-                            "category": "custom",
-                            # No 'keys' field — daemon will send as response text
-                        })
-                return opts
+        m = re.search(r'\[.*?\]', text, re.DOTALL)
+        if not m:
+            return None
+
+        suggestions = json.loads(m.group())
+        if not isinstance(suggestions, list):
+            return None
+
+        opts = []
+        for s in suggestions[:5]:
+            if isinstance(s, str) and s.strip():
+                opts.append({
+                    "text": s.strip()[:30],
+                    "category": "custom",
+                })
+        return opts if opts else None
+
+    except subprocess.TimeoutExpired:
+        print(f"claude CLI timed out for {session_name}", file=sys.stderr)
     except Exception as e:
-        print(f"LLM suggestion failed for {session_name}: {e}", file=sys.stderr)
+        print(f"claude CLI error for {session_name}: {e}", file=sys.stderr)
     return None
 
 
@@ -163,7 +191,7 @@ def get_user_input_suggestions(session_name: str, terminal: str):
         {"text": "show the result", "category": "custom"},
     ]
 
-    if not _anthropic_client:
+    if not CLAUDE_CLI:
         return fallback
 
     h = _terminal_hash(terminal)
@@ -365,7 +393,7 @@ def capture_pane(session_name: str) -> str:
 @app.route("/api/state", methods=["GET"])
 def get_state():
     sessions = list_sessions()
-    return jsonify({"sessions": sessions, "llm_enabled": _anthropic_client is not None})
+    return jsonify({"sessions": sessions, "llm_enabled": CLAUDE_CLI is not None})
 
 
 @app.route("/api/action", methods=["POST"])
@@ -423,14 +451,14 @@ def post_action():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "llm_enabled": _anthropic_client is not None})
+    return jsonify({"status": "ok", "llm_enabled": CLAUDE_CLI is not None, "claude_cli": CLAUDE_CLI})
 
 
 def main():
     config = load_config()
     host = config["host"]
     port = config["port"]
-    llm_status = "enabled" if _anthropic_client else "disabled (set ANTHROPIC_API_KEY)"
+    llm_status = f"enabled ({CLAUDE_CLI})" if CLAUDE_CLI else "disabled (claude CLI not found)"
     print(f"VibeBoy daemon listening on {host}:{port} (LLM suggestions: {llm_status})")
     app.run(host=host, port=port, debug=False)
 
