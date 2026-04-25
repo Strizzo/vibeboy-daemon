@@ -31,6 +31,8 @@ WorkingDirectory=%h/vibeboy-daemon
 ExecStart=/usr/bin/python3 vibeboy_daemon.py
 Restart=always
 RestartSec=3
+# Optional: enable LLM-powered prompt suggestions for Claude Code sessions
+# Environment=ANTHROPIC_API_KEY=sk-ant-...
 
 [Install]
 WantedBy=default.target
@@ -59,7 +61,20 @@ See the [VibeBoy cartridge README](https://github.com/Strizzo/vibeboy-cartridge)
 | `/api/action` | POST | Send commands, interrupt, create/kill sessions |
 | `/api/health` | GET | Health check |
 
-### Actions
+## LLM-Powered Suggestions
+
+When Claude Code is waiting for your next prompt, the daemon can suggest contextual prompts based on the conversation. Set `ANTHROPIC_API_KEY` to enable:
+
+```bash
+# In your shell or in the systemd service
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Without an API key, the daemon falls back to generic prompts ("continue", "explain", etc.).
+
+The daemon uses Claude Haiku for cheap, fast suggestions. Each Claude Code session triggers ~1 API call per minute when actively used.
+
+## Actions
 
 ```json
 {"action": "send_keys", "session_id": "mysession", "payload": {"keys": "ls -la"}}

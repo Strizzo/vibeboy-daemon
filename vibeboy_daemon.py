@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """VibeBoy Daemon - HTTP API for managing tmux sessions and Claude Code."""
 
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import time
+import threading
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -15,170 +19,274 @@ from flask import Flask, jsonify, request
 
 # Match ANSI escape sequences (colors, cursor movement, OSC, etc.)
 _ANSI_RE = re.compile(
-    r'\x1b\[[0-9;]*[a-zA-Z]'       # CSI sequences (colors, cursor)
-    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'  # OSC sequences
-    r'|\x1b[()][AB012]'             # Character set selection
-    r'|\x1b[>=<]'                   # Keypad modes
-    r'|\x1b\[[\?]?[0-9;]*[hlm]'    # Mode set/reset
-    r'|\x1b.'                       # Any other escape
-    r'|\x0f|\x0e'                   # SI/SO
-    r'|\r'                          # Carriage returns
+    r'\x1b\[[0-9;]*[a-zA-Z]'
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
+    r'|\x1b[()][AB012]'
+    r'|\x1b[>=<]'
+    r'|\x1b\[[\?]?[0-9;]*[hlm]'
+    r'|\x1b.'
+    r'|\x0f|\x0e'
+    r'|\r'
 )
+
+_UNICODE_TO_ASCII = {
+    '─': '-', '│': '|', '┌': '+', '┐': '+', '└': '+', '┘': '+',
+    '├': '+', '┤': '+', '┬': '+', '┴': '+', '┼': '+',
+    '━': '-', '┃': '|', '┏': '+', '┓': '+', '┗': '+', '┛': '+',
+    '•': '*', '·': '*', '●': '*', '○': '*', '◯': '*',
+    '→': '>', '▶': '>', '►': '>', '▸': '>', '➜': '>',
+    '←': '<', '◀': '<', '◄': '<', '◂': '<',
+    '↑': '^', '▲': '^', '⬆': '^',
+    '↓': 'v', '▼': 'v', '⬇': 'v',
+    '✓': '[ok]', '✔': '[ok]', '☑': '[ok]',
+    '✗': '[x]', '✘': '[x]', '✕': '[x]', '☒': '[x]',
+    '…': '...', '⋯': '...',
+    '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
+    '\u2013': '-', '\u2014': '-',
+    '❯': '>', '❮': '<',
+    '✻': '*', '✼': '*', '✽': '*',
+}
 
 
 def clean_terminal(text: str) -> str:
     """Clean terminal output: strip ANSI, ensure pure ASCII."""
     text = _ANSI_RE.sub('', text)
-    # Replace non-ASCII with approximations or strip
     result = []
     for ch in text:
-        code = ord(ch)
-        if ch == '\n' or ch == '\t':
+        if ch in _UNICODE_TO_ASCII:
+            result.append(_UNICODE_TO_ASCII[ch])
+        elif ch == '\n' or ch == '\t':
             result.append(ch)
-        elif 32 <= code < 127:
+        elif 32 <= ord(ch) < 127:
             result.append(ch)
-        elif ch in ('\u2500', '\u2502', '\u250c', '\u2510', '\u2514', '\u2518',
-                     '\u251c', '\u2524', '\u252c', '\u2534', '\u253c'):
-            # Box drawing -> ASCII
-            result.append({'─': '-', '│': '|', '┌': '+', '┐': '+',
-                           '└': '+', '┘': '+', '├': '+', '┤': '+',
-                           '┬': '+', '┴': '+', '┼': '+'}.get(ch, '+'))
-        elif ch in ('•', '·', '●', '○'):
-            result.append('*')
-        elif ch in ('→', '▶', '►', '▸'):
-            result.append('>')
-        elif ch in ('←', '◀', '◄', '◂'):
-            result.append('<')
-        elif ch in ('↑', '▲'):
-            result.append('^')
-        elif ch in ('↓', '▼'):
-            result.append('v')
-        elif ch in ('✓', '✔'):
-            result.append('[ok]')
-        elif ch in ('✗', '✘', '✕'):
-            result.append('[x]')
-        elif ch in ('\u2026',):  # ellipsis
-            result.append('...')
-        elif ch in ('\u2018', '\u2019'):  # smart quotes
-            result.append("'")
-        elif ch in ('\u201c', '\u201d'):
-            result.append('"')
-        elif ch in ('\u2013', '\u2014'):  # dashes
-            result.append('-')
-        elif code >= 128:
-            pass  # drop other non-ASCII silently
+        # drop other non-ASCII silently
     return ''.join(result)
 
 
 # ---------------------------------------------------------------------------
-# Terminal analysis - detect prompts and suggest actions
+# LLM-based prompt suggestions
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+_anthropic_client = None
+if ANTHROPIC_API_KEY:
+    try:
+        from anthropic import Anthropic
+        _anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    except ImportError:
+        print("anthropic package not installed; LLM suggestions disabled")
+
+# Cache: session_name -> (terminal_hash, suggestions, timestamp)
+_suggestion_cache = {}
+_suggestion_lock = threading.Lock()
+_inflight = set()  # session names currently being processed
+_inflight_lock = threading.Lock()
+
+CACHE_TTL_SECONDS = 60
+
+
+def _terminal_hash(terminal: str) -> str:
+    """Hash the meaningful part of terminal content (last 2KB)."""
+    return hashlib.md5(terminal[-2000:].encode('utf-8', errors='replace')).hexdigest()
+
+
+def _fetch_llm_suggestions(session_name: str, terminal: str):
+    """Call Anthropic API to generate contextual prompt suggestions."""
+    if not _anthropic_client:
+        return None
+    try:
+        # Use the last ~2KB of terminal content as context
+        context = terminal[-2000:]
+        msg = _anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "I'm using Claude Code on a tiny handheld device with a tiny screen. "
+                    "Looking at the recent Claude Code session below, suggest 5 SHORT next-message "
+                    "prompts I could send to Claude. Each prompt MUST be under 30 characters. "
+                    "Make them contextually useful based on what's happening. "
+                    "Output ONLY a JSON array of strings, nothing else.\n\n"
+                    f"Session output:\n```\n{context}\n```\n\nJSON array:"
+                )
+            }]
+        )
+        text = msg.content[0].text.strip()
+        # Extract JSON array
+        m = re.search(r'\[[^\[]*\]', text, re.DOTALL)
+        if m:
+            suggestions = json.loads(m.group())
+            if isinstance(suggestions, list):
+                # Convert to option format
+                opts = []
+                for s in suggestions[:5]:
+                    if isinstance(s, str) and s:
+                        opts.append({
+                            "text": s[:30],
+                            "category": "custom",
+                            # No 'keys' field — daemon will send as response text
+                        })
+                return opts
+    except Exception as e:
+        print(f"LLM suggestion failed for {session_name}: {e}", file=sys.stderr)
+    return None
+
+
+def _refresh_suggestions_async(session_name: str, terminal: str):
+    """Refresh LLM suggestions in a background thread (non-blocking)."""
+    with _inflight_lock:
+        if session_name in _inflight:
+            return
+        _inflight.add(session_name)
+
+    def _worker():
+        try:
+            opts = _fetch_llm_suggestions(session_name, terminal)
+            if opts:
+                h = _terminal_hash(terminal)
+                with _suggestion_lock:
+                    _suggestion_cache[session_name] = (h, opts, time.time())
+        finally:
+            with _inflight_lock:
+                _inflight.discard(session_name)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def get_user_input_suggestions(session_name: str, terminal: str):
+    """Return LLM-generated suggestions for a Claude Code waiting state."""
+    fallback = [
+        {"text": "continue", "category": "custom"},
+        {"text": "what should I do next?", "category": "custom"},
+        {"text": "explain", "category": "custom"},
+        {"text": "show the result", "category": "custom"},
+    ]
+
+    if not _anthropic_client:
+        return fallback
+
+    h = _terminal_hash(terminal)
+    now = time.time()
+    with _suggestion_lock:
+        cached = _suggestion_cache.get(session_name)
+
+    # Cached and fresh -> return cached
+    if cached and cached[0] == h and now - cached[2] < CACHE_TTL_SECONDS:
+        return cached[1]
+
+    # Cached but stale or different content -> kick off refresh, return cached or fallback
+    _refresh_suggestions_async(session_name, terminal)
+    if cached:
+        return cached[1]
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# Session state analysis
 # ---------------------------------------------------------------------------
 
 def analyze_session(terminal: str, name: str) -> dict:
     """Analyze terminal content and return session metadata with smart actions."""
-    lines = terminal.strip().split('\n') if terminal.strip() else []
-    last_lines = lines[-10:] if lines else []
-    last_text = '\n'.join(last_lines).lower()
-    last_line = lines[-1].strip() if lines else ""
+    if not terminal.strip():
+        return {
+            "session_type": "idle_shell",
+            "status": "idle",
+            "response_options": [
+                {"text": "Refresh", "category": "custom", "keys": "Enter"},
+                {"text": "Interrupt", "category": "danger", "keys": "C-c"},
+            ],
+        }
 
-    session_type = "idle_shell"
-    status = "idle"
-    options = []
+    lines = terminal.split('\n')
+    last_line = lines[-1].rstrip() if lines else ''
+    full_text = terminal.lower()
 
-    # Detect Claude Code permission prompt / waiting state
-    cc_permission = any(x in last_text for x in (
-        'bypass permissions', 'shift+tab to cycle', 'allow once',
-        'allow always', 'deny', 'approve for this session',
-    ))
-    cc_question = any(x in last_text for x in (
-        'do you want', 'would you like', 'shall i', 'should i',
-        'proceed?', 'continue?', 'confirm?',
-    ))
-    cc_thinking = any(x in last_text for x in (
-        'thinking', 'generating', 'processing', 'searching',
-        'reading', 'writing', 'editing',
-    ))
+    # Detect Claude Code by its UI footer
+    is_claude_ui = (
+        'bypass permissions on' in full_text or
+        'shift+tab to cycle' in full_text or
+        'ctrl-g to edit prompt' in full_text or
+        'esc to interrupt' in full_text
+    )
 
-    # Detect Claude Code by session name or terminal content
-    is_claude = any(
-        x in last_text for x in ('claude', 'anthropic', 'tool_use', 'claude-code')
-    ) or any(
-        x in name.lower() for x in ('claude', 'cc-', 'cc_')
-    ) or cc_permission
-
-    # Detect Y/N or yes/no prompts
-    yn_match = re.search(r'\[([yY]/[nN]|[nN]/[yY])\]', last_line) or \
-               re.search(r'\(yes/no\)', last_line, re.IGNORECASE) or \
-               re.search(r'\(y/n\)', last_line, re.IGNORECASE)
-
-    # Detect generic question (ends with ?)
-    is_question = last_line.rstrip().endswith('?')
-
-    # Detect shell prompt ($ or # at end, possibly with path)
-    is_shell = bool(re.search(r'[$#]\s*$', last_line))
-
-    # Detect running process (no prompt visible)
-    has_activity = len(last_line.strip()) > 0 and not is_shell
-
-    if is_claude:
-        session_type = "claude_code"
-        if cc_permission:
-            status = "waiting"
-            options.append({"text": "Allow once", "category": "approve", "keys": "Enter"})
-            options.append({"text": "Allow always", "category": "approve"})
-            options.append({"text": "Deny", "category": "deny"})
-        elif cc_question or yn_match or is_question:
-            status = "waiting"
-            options.append({"text": "Yes", "category": "approve"})
-            options.append({"text": "No", "category": "deny"})
-        elif cc_thinking:
-            status = "thinking"
-        elif is_shell:
-            status = "idle"
-            options.append({"text": "claude", "category": "custom", "keys": "claude"})
+    # Plain shell session (not Claude Code)
+    if not is_claude_ui:
+        if re.search(r'[$#]\s*$', last_line):
+            return {
+                "session_type": "idle_shell",
+                "status": "idle",
+                "response_options": [
+                    {"text": "ls -la", "category": "custom", "keys": "ls -la"},
+                    {"text": "git status", "category": "custom", "keys": "git status"},
+                    {"text": "git log --oneline -10", "category": "custom", "keys": "git log --oneline -10"},
+                    {"text": "claude", "category": "custom", "keys": "claude"},
+                    {"text": "Interrupt", "category": "danger", "keys": "C-c"},
+                ],
+            }
         else:
-            status = "running"
-    elif yn_match:
-        session_type = "interactive_prompt"
-        status = "waiting"
-        options.append({"text": "y", "category": "approve"})
-        options.append({"text": "n", "category": "deny"})
-    elif is_question:
-        session_type = "interactive_prompt"
-        status = "waiting"
-        options.append({"text": "yes", "category": "approve"})
-        options.append({"text": "no", "category": "deny"})
-    elif is_shell:
-        session_type = "idle_shell"
-        status = "idle"
-    elif has_activity:
-        session_type = "running_process"
-        status = "running"
+            return {
+                "session_type": "running_process",
+                "status": "running",
+                "response_options": [
+                    {"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"},
+                    {"text": "Suspend (Ctrl+Z)", "category": "custom", "keys": "C-z"},
+                ],
+            }
 
-    # Common actions based on type
-    if session_type == "running_process":
-        options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
-        options.append({"text": "Suspend (Ctrl+Z)", "category": "custom", "keys": "C-z"})
-    elif session_type == "idle_shell":
-        options.insert(0, {"text": "git status", "category": "custom", "keys": "git status"})
-        options.insert(0, {"text": "git log --oneline -10", "category": "custom", "keys": "git log --oneline -10"})
-        options.insert(0, {"text": "ls -la", "category": "custom", "keys": "ls -la"})
-        options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
-    else:
-        options.append({"text": "Interrupt (Ctrl+C)", "category": "danger", "keys": "C-c"})
+    # Claude Code session — detect specific state
+
+    # Permission prompt: numbered list with Yes/No/Allow/Deny variants
+    has_numbered_options = bool(re.search(
+        r'^\s*[1-9]\.\s+(Yes|No|Approve|Deny|Allow)',
+        terminal, re.MULTILINE | re.IGNORECASE
+    ))
+    has_do_you_want = 'do you want to' in full_text
+
+    if has_numbered_options or has_do_you_want:
+        return {
+            "session_type": "claude_code",
+            "status": "permission",
+            "response_options": [
+                {"text": "Approve (1)", "category": "approve", "keys": "1"},
+                {"text": "Approve always (2)", "category": "approve", "keys": "2"},
+                {"text": "Deny (3)", "category": "deny", "keys": "3"},
+                {"text": "Cancel (Esc)", "category": "danger", "keys": "Escape"},
+            ],
+        }
+
+    # Thinking / processing state
+    is_thinking = (
+        'esc to interrupt' in full_text or
+        re.search(r'\b(thinking|processing|generating|searching)\b', full_text) is not None
+    )
+    if is_thinking and 'esc to interrupt' in full_text:
+        return {
+            "session_type": "claude_code",
+            "status": "thinking",
+            "response_options": [
+                {"text": "Interrupt (Esc)", "category": "danger", "keys": "Escape"},
+                {"text": "Force kill (Ctrl+C)", "category": "danger", "keys": "C-c"},
+            ],
+        }
+
+    # Default: Claude Code waiting for user input
+    suggestions = get_user_input_suggestions(name, terminal)
+    suggestions = list(suggestions)
+    suggestions.append({"text": "Interrupt", "category": "danger", "keys": "C-c"})
 
     return {
-        "session_type": session_type,
-        "status": status,
-        "response_options": options,
+        "session_type": "claude_code",
+        "status": "waiting",
+        "response_options": suggestions,
     }
 
 
-app = Flask(__name__)
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+app = Flask(__name__)
 
 DEFAULT_CONFIG = {"host": "127.0.0.1", "port": 8766}
 
@@ -197,7 +305,6 @@ def load_config():
 
 
 def tmux(*args: str) -> str:
-    """Run a tmux command and return stdout."""
     result = subprocess.run(
         ["tmux", *args], capture_output=True, text=True, timeout=5
     )
@@ -205,7 +312,6 @@ def tmux(*args: str) -> str:
 
 
 def tmux_ok(*args: str) -> bool:
-    """Run a tmux command and return whether it succeeded."""
     result = subprocess.run(
         ["tmux", *args], capture_output=True, text=True, timeout=5
     )
@@ -213,7 +319,6 @@ def tmux_ok(*args: str) -> bool:
 
 
 def list_sessions() -> dict:
-    """List all tmux sessions with metadata and analysis."""
     try:
         raw = tmux(
             "list-sessions",
@@ -233,7 +338,6 @@ def list_sessions() -> dict:
         name = parts[0]
         terminal = capture_pane(name)
         analysis = analyze_session(terminal, name)
-
         sessions[name] = {
             "name": name,
             "created": int(parts[1]) if parts[1].isdigit() else 0,
@@ -246,7 +350,6 @@ def list_sessions() -> dict:
 
 
 def capture_pane(session_name: str) -> str:
-    """Capture visible terminal output from a session's active pane."""
     try:
         raw = tmux("capture-pane", "-t", session_name, "-p")
         return clean_terminal(raw)
@@ -261,14 +364,12 @@ def capture_pane(session_name: str) -> str:
 
 @app.route("/api/state", methods=["GET"])
 def get_state():
-    """Return full daemon state including all tmux sessions."""
     sessions = list_sessions()
-    return jsonify({"sessions": sessions})
+    return jsonify({"sessions": sessions, "llm_enabled": _anthropic_client is not None})
 
 
 @app.route("/api/action", methods=["POST"])
 def post_action():
-    """Execute an action on a tmux session."""
     data = request.get_json(silent=True) or {}
     action = data.get("action", "")
     session_id = data.get("session_id", "")
@@ -281,8 +382,9 @@ def post_action():
         keys = payload.get("keys", "")
         if not keys or not session_id:
             return jsonify({"error": "missing keys or session_id"}), 400
-        # Don't add Enter for control sequences
-        if keys.startswith("C-") or keys in ("Enter", "Up", "Down", "Left", "Right"):
+        # Don't append Enter for control sequences or named keys
+        named = ("Enter", "Up", "Down", "Left", "Right", "Tab", "Escape", "BSpace")
+        if keys.startswith("C-") or keys.startswith("M-") or keys in named or len(keys) <= 2:
             tmux("send-keys", "-t", session_id, keys)
         else:
             tmux("send-keys", "-t", session_id, keys, "Enter")
@@ -298,7 +400,7 @@ def post_action():
     elif action == "interrupt":
         if not session_id:
             return jsonify({"error": "missing session_id"}), 400
-        tmux("send-keys", "-t", session_id, "C-c", "")
+        tmux("send-keys", "-t", session_id, "C-c")
         return jsonify({"ok": True})
 
     elif action == "new_session":
@@ -321,19 +423,15 @@ def post_action():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+    return jsonify({"status": "ok", "llm_enabled": _anthropic_client is not None})
 
 
 def main():
     config = load_config()
     host = config["host"]
     port = config["port"]
-    print(f"VibeBoy daemon listening on {host}:{port}")
+    llm_status = "enabled" if _anthropic_client else "disabled (set ANTHROPIC_API_KEY)"
+    print(f"VibeBoy daemon listening on {host}:{port} (LLM suggestions: {llm_status})")
     app.run(host=host, port=port, debug=False)
 
 
