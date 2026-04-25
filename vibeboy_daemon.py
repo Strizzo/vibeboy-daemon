@@ -113,15 +113,25 @@ def _fetch_llm_suggestions(session_name: str, terminal: str):
     if not CLAUDE_CLI:
         return None
 
-    # Use the last ~2KB of terminal content as context
-    context = terminal[-2000:]
+    # Use a generous slice of terminal content for rich conversational context
+    context = terminal[-8000:]
     prompt = (
-        "I'm using Claude Code on a tiny handheld device with a tiny screen. "
-        "Looking at the recent Claude Code session output below, suggest 5 SHORT "
-        "next-message prompts I could send to Claude. Each prompt MUST be under "
-        "30 characters. Make them contextually useful based on what's happening "
-        "in the conversation. Output ONLY a JSON array of strings, nothing else "
-        "before or after.\n\n"
+        "You are helping me work with my Claude Code session remotely from a "
+        "small handheld device where typing is hard. Below is the recent terminal "
+        "output of my Claude Code session, including both my messages (lines "
+        "starting with '>') and Claude's responses (often starting with '*' or "
+        "containing tool output).\n\n"
+        "Suggest 6 SPECIFIC next messages I might want to send to Claude. "
+        "Requirements:\n"
+        "- Each prompt must be a complete, useful message (1-2 sentences)\n"
+        "- Length: between 30 and 140 characters each\n"
+        "- Make them genuinely contextual: reference specific things from the "
+        "conversation (file names, errors, decisions, options Claude offered)\n"
+        "- Mix types: follow-up questions, refinements, next steps, course "
+        "corrections, requests for explanations\n"
+        "- Avoid generic prompts like 'continue' or 'explain' unless that's "
+        "really the most useful thing\n\n"
+        "Output ONLY a JSON array of strings. Nothing before or after.\n\n"
         f"Session output:\n```\n{context}\n```\n\nJSON array:"
     )
 
@@ -136,8 +146,8 @@ def _fetch_llm_suggestions(session_name: str, terminal: str):
             return None
 
         text = result.stdout.strip()
-        # Extract JSON array
-        m = re.search(r'\[.*?\]', text, re.DOTALL)
+        # Extract JSON array (greedy to capture multi-line strings)
+        m = re.search(r'\[.*\]', text, re.DOTALL)
         if not m:
             return None
 
@@ -146,10 +156,11 @@ def _fetch_llm_suggestions(session_name: str, terminal: str):
             return None
 
         opts = []
-        for s in suggestions[:5]:
+        for s in suggestions[:6]:
             if isinstance(s, str) and s.strip():
+                # Hard cap at 200 chars to prevent runaway responses
                 opts.append({
-                    "text": s.strip()[:30],
+                    "text": s.strip()[:200],
                     "category": "custom",
                 })
         return opts if opts else None
