@@ -404,7 +404,17 @@ def capture_pane(session_name: str) -> str:
 @app.route("/api/state", methods=["GET"])
 def get_state():
     sessions = list_sessions()
-    return jsonify({"sessions": sessions, "llm_enabled": CLAUDE_CLI is not None})
+    payload = {"sessions": sessions, "llm_enabled": CLAUDE_CLI is not None}
+
+    # ETag support: return 304 if the client already has this version.
+    # Saves bandwidth and JSON decode time on the cartridge.
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    etag = '"' + hashlib.md5(body.encode("utf-8")).hexdigest() + '"'
+    if request.headers.get("If-None-Match") == etag:
+        return ("", 304, {"ETag": etag})
+    resp = app.response_class(body, mimetype="application/json")
+    resp.headers["ETag"] = etag
+    return resp
 
 
 @app.route("/api/action", methods=["POST"])
